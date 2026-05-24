@@ -1,0 +1,349 @@
+name: Sync
+
+on:
+  workflow_dispatch:
+    # inputs:
+    #   repo:
+    #     type: string
+    #     description: 'Target repo'
+    #     required: false
+    #     default: ''
+  schedule:
+    - cron: '43 1 * * *'
+  push:
+
+concurrency:
+  group: sync
+
+# for beacon-biosignals/matrix-output
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prepare_matrix:
+    runs-on: ubuntu-slim
+    outputs:
+      chunks: ${{ steps.split.outputs.matrix }}
+    steps:
+      - name: Split
+        id: split
+        run: |
+          PARALLEL=20
+          MATRIX=$(curl -s "https://kernel.googlesource.com/?format=JSON" | tail -n +2 | jq -c '.[]' | shuf | \
+                    split -n l/$PARALLEL --filter='jq -Rs .' | jq -sc .)
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+  main:
+    runs-on: ubuntu-latest
+    needs: prepare_matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJson(needs.prepare_matrix.outputs.chunks) }}
+    # outputs:
+    #   failed: ${{ steps.matrix-output.outputs.json }}
+    steps:
+      - name: List targets
+        env:
+          CHUNK_DATA: ${{ matrix.chunk }}
+        run: echo "$CHUNK_DATA"
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # - uses: jlumbroso/free-disk-space@main
+      #   with:
+      #     tool-cache: true
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+          owner: kernelorg-mirror
+
+      - name: Get GitHub App User ID
+        id: get-user-id
+        run: echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - run: df -h
+
+      - name: Sync
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          CHUNK_DATA: ${{ matrix.chunk }}
+          APP_ID: ${{ secrets.APP_ID }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          INSTALLATION_ID: ${{ secrets.INSTALLATION_ID }}
+        run: |
+          # set -x
+
+          REPO_DIR="$(pwd)"
+          MAX_JOBS=15
+          LAST_UPDATE=$(date +%s)
+
+          git config --global user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
+          git config --global user.email '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+          git config --global url."https://x-access-token:$GH_TOKEN@github.com/".insteadOf "https://github.com/"
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.window 0
+          git config --global pack.depth 0
+
+          # not required
+          git config --global init.defaultBranch main
+
+          tmp_fifo=$(mktemp -u)
+          mkfifo "$tmp_fifo"
+          exec 3<>"$tmp_fifo"
+          # rm "$tmp_fifo"
+
+          for ((i=0; i<MAX_JOBS; i++)); do
+            echo >&3
+          done
+
+          sudo mkdir /mnt/sync
+          sudo touch /mnt/failed-repos
+          sudo chown runner:runner -R /mnt/sync /mnt/failed-repos
+
+          function check_and_refresh_token() {
+            local now=$(date +%s)
+            if (( now - LAST_UPDATE > 3000 )); then
+              echo "--- Token expired or near expiry. Refreshing... ---"
+              local token=$($REPO_DIR/gh_token_refresh.sh)
+              if [ "$token" = "null" ]; then
+                echo "Failed to refresh token"
+                return 1
+              fi
+              git config --global --remove-section "url.https://x-access-token:${GH_TOKEN}@github.com/" 2>/dev/null || true
+              export GH_TOKEN="$token"
+              git config --global url."https://x-access-token:$GH_TOKEN@github.com/".insteadOf "https://github.com/"
+              LAST_UPDATE=$now
+              echo "--- Token refreshed. ---"
+            fi
+          }
+
+          function log() {
+            # echo "[$repo]" "${@}"
+            echo "${@}"
+          }
+
+          function sync_mirror() {
+            set -e
+
+            url=$(jq -r '.clone_url' <<< "$config")
+            repo=$(jq -r '.name' <<< "$config" | tr '/' '_' | cut -c 9-)
+            description=$(jq -r '.description // ""' <<< "$config" | head -n1)
+            first="0"
+
+            mkdir "$repo" && cd "$repo"
+
+            log "Check if the mirror repository is created"
+            set +e
+            curl -I --fail --silent --show-error -o /dev/null "https://github.com/kernelorg-mirror/$repo"
+            ret="$?"
+            set -e
+            if [ "$ret" -ne 0 ]; then
+              log "Creating target repo"
+              gh repo create "kernelorg-mirror/$repo" --homepage "$url" --disable-issues --disable-wiki --public --description "$description"
+              first="1"
+            fi
+
+            log "Compare remotes"
+            git ls-remote --quiet --heads --tags "$url" > remote-src &
+            git ls-remote --quiet --heads --tags "https://github.com/kernelorg-mirror/$repo" > remote-dist &
+            wait
+            set +e
+            diff remote-src remote-dist > /dev/null
+            ret="$?"
+            set -e
+            if [ "$ret" -eq 0 ]; then
+              log "Mirror is synchronized. skip"
+              return
+            fi
+
+            log "Cloning source repo"
+            mkdir repo-dir && cd repo-dir
+            git init --bare
+            git remote add --mirror=fetch origin "$url"
+            git remote add mirror "https://github.com/kernelorg-mirror/$repo"
+
+            git config unset --all remote.origin.fetch
+            git config unset --all remote.mirror.fetch
+            git config set --append remote.origin.fetch '+refs/heads/*:refs/heads/*'
+            git config set --append remote.origin.fetch "^refs/heads/refs/*"
+            git config set --append remote.mirror.fetch '+refs/heads/*:refs/heads/*'
+            git config set --append remote.origin.fetch '+refs/tags/*:refs/tags/*'
+            git config set --append remote.mirror.fetch '+refs/tags/*:refs/tags/*'
+
+            if [ "$first" -eq 0 ]; then
+              log "Fetching from mirror"
+              git fetch --quiet mirror --filter=blob:none
+              log "Fetching from origin"
+              git fetch --quiet --prune --prune-tags origin
+            else
+              log "First time sync. full cloning"
+              git fetch --quiet origin
+            fi
+
+            log "Pushing to mirror repo"
+            set +e
+            git push --quiet --mirror mirror
+            ret="$?"
+            set -e
+            if [ "$ret" -ne 0 ]; then
+              log "Failed to push, fallback"
+              BRANCHES=$(git for-each-ref --format='%(refname:lstrip=2)' refs/heads/)
+
+              for CURRENT_BRANCH in $BRANCHES; do
+                log "=== Processing branch: $CURRENT_BRANCH ==="
+
+                BATCH=0
+                MAX_BATCH=100000
+                MIN_BATCH=1
+
+                TOTAL_ORIG=$(git rev-list --count "refs/heads/$CURRENT_BRANCH")
+                PROCESSED=0
+
+                while true; do
+                  check_and_refresh_token
+
+                  MIRROR_TIP=$(git ls-remote mirror "refs/heads/$CURRENT_BRANCH" | awk '{print $1}')
+
+                  if [ -n "$MIRROR_TIP" ]; then
+                    mapfile -t COMMITS < <(git rev-list --reverse --ancestry-path "${MIRROR_TIP}..refs/heads/${CURRENT_BRANCH}")
+                  else
+                    mapfile -t COMMITS < <(git rev-list --reverse "refs/heads/$CURRENT_BRANCH")
+                  fi
+
+                  TOTAL=${#COMMITS[@]}
+
+                  if [ "$TOTAL" -eq 0 ]; then
+                    log "Already up-to-date. skip"
+                    break
+                  fi
+
+                  log "Total new commits: $TOTAL (mirror tip: ${MIRROR_TIP:-none})"
+
+                  if [ "$BATCH" -eq 0 ]; then
+                    CURRENT_TRY=$TOTAL
+                  else
+                    CURRENT_TRY=$(( TOTAL < BATCH ? TOTAL : BATCH ))
+                  fi
+
+                  TARGET_REV=${COMMITS[$((CURRENT_TRY - 1))]}
+
+                  log "--- Attempting: $CURRENT_TRY commits (Progress (approx): $PROCESSED/$TOTAL_ORIG) ---"
+
+                  if git push mirror "$TARGET_REV:refs/heads/$CURRENT_BRANCH"; then
+                    log ">> Success."
+
+                    PROCESSED=$((PROCESSED + CURRENT_TRY))
+
+                    if [ "$BATCH" -eq 0 ]; then
+                      BATCH=$CURRENT_TRY
+                    fi
+
+                    BATCH=$((BATCH * 12 / 10 + 3))
+                    [ $BATCH -gt $MAX_BATCH ] && BATCH=$MAX_BATCH
+
+                    log ">> Increasing batch size to $BATCH for next step."
+                  else
+                    log ">> Failed! Reducing batch size..."
+
+                    if [ "$BATCH" -eq 0 ]; then
+                      BATCH=$((CURRENT_TRY / 2))
+                    else
+                      if [ $BATCH -gt $CURRENT_TRY ]; then
+                        BATCH=$CURRENT_TRY
+                      else
+                        if [ $BATCH -le 3 ]; then
+                          BATCH=$((BATCH - 1))
+                        else
+                          BATCH=$((BATCH / 2))
+                        fi
+                      fi
+                    fi
+
+                    if [ $BATCH -lt $MIN_BATCH ]; then
+                      if [ $CURRENT_TRY -eq 1 ]; then
+                        log "Fatal: Single commit push failed. Check for large files or remote limits."
+                        return 1
+                      fi
+                      BATCH=$MIN_BATCH
+                    fi
+
+                    log ">> Retrying with smaller batch: $BATCH"
+                  fi
+                done
+              done
+              gh repo edit "kernelorg-mirror/$repo" --default-branch "$( git remote show origin | grep "^  HEAD branch: " | cut -c 16- )"
+              git push mirror --mirror
+            fi
+
+            gh repo edit "kernelorg-mirror/$repo" --default-branch "$( git remote show origin | grep "^  HEAD branch: " | cut -c 16- )"
+          }
+
+          TOTAL_COUNT=$(grep -c '^' <<<  "$CHUNK_DATA")
+          CURRENT=0
+          cd /mnt/sync
+
+          while IFS= read -r config; do
+            [ -z "$config" ] && continue
+
+            read -u 3
+            CURRENT=$((CURRENT + 1))
+            check_and_refresh_token
+            export config
+
+            (
+              start_time=$(date +%s.%N)
+              repo=$(jq -r '.name' <<< "$config" | tr '/' '_' | cut -c 9-)
+              status="OK"
+              echo "::group::$repo"
+              log "Start"
+              if grep -xF "/$repo" "$REPO_DIR/skip.list"; then
+                log "Done (Skip) ($CURRENT/$TOTAL_COUNT)"
+                echo >&3
+                exit
+              fi
+              if ! sync_mirror "$config"; then
+                log "Failed"
+                echo "$repo" >> /mnt/failed-repos
+                status="Failed"
+              fi
+              echo >&3
+              # log "Cleaning"
+              rm -rf "/mnt/sync/$repo" &
+              end_time=$(date +%s.%N)
+              log "Done ($status) ($CURRENT/$TOTAL_COUNT) ($(echo "$end_time - $start_time" | bc) sec)"
+              echo "::endgroup::"
+            )
+            # )&
+          done <<< "$CHUNK_DATA"
+
+          echo "Waiting for all jobs to complete"
+          sleep 0.5
+          for ((i=0; i<MAX_JOBS; i++)); do
+            echo "waiting job: $i"
+            read -u 3
+          done
+          echo "done"
+
+          exec 3>&-
+          exec 3<&-
+          rm "$tmp_fifo"
+
+      - name: List failed repos
+        if: always()
+        id: failed
+        run: |
+          cat /mnt/failed-repos
+          # echo "list=$(cat /mnt/failed-repos)" >> $GITHUB_OUTPUT
+          if [[ -s /mnt/failed-repos ]]; then
+            exit 1
+          fi
