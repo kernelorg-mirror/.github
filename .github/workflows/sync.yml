@@ -93,6 +93,7 @@ jobs:
           git config --global pack.packSizeLimit 100m
           git config --global pack.window 0
           git config --global pack.depth 0
+          git config --global fetch.showForcedUpdates false
 
           # not required
           git config --global init.defaultBranch main
@@ -199,88 +200,64 @@ jobs:
               log "Failed to push, fallback"
               BRANCHES=$(git for-each-ref --sort=committerdate --format='%(refname:lstrip=2)' refs/heads/)
 
+              INITIAL_BATCH=50000
+              MAX_BATCH=100000
+              MIN_BATCH=1
+
               for CURRENT_BRANCH in $BRANCHES; do
                 log "=== Processing branch: $CURRENT_BRANCH ==="
 
-                BATCH=0
-                MAX_BATCH=100000
-                MIN_BATCH=1
+                check_and_refresh_token
 
-                TOTAL_ORIG=$(git rev-list --count "refs/heads/$CURRENT_BRANCH")
+                MIRROR_TIP=$(git ls-remote mirror "refs/heads/$CURRENT_BRANCH" | awk '{print $1}')
+                if [ -n "$MIRROR_TIP" ]; then
+                  mapfile -t COMMITS < <(git rev-list --reverse --ancestry-path "${MIRROR_TIP}..refs/heads/${CURRENT_BRANCH}")
+                else
+                  mapfile -t COMMITS < <(git rev-list --reverse "refs/heads/$CURRENT_BRANCH")
+                fi
+
+                TOTAL=${#COMMITS[@]}
+                if [ "$TOTAL" -eq 0 ]; then
+                  log "Already up-to-date. skip"
+                  continue
+                fi
+
+                log "Total new commits: $TOTAL (mirror tip: ${MIRROR_TIP:-none})"
+
                 PROCESSED=0
+                INDEX=0
+                BATCH=$INITIAL_BATCH
 
-                while true; do
+                while [ $INDEX -lt $TOTAL ]; do
                   check_and_refresh_token
 
-                  MIRROR_TIP=$(git ls-remote mirror "refs/heads/$CURRENT_BRANCH" | awk '{print $1}')
+                  REMAINING=$((TOTAL - INDEX))
+                  CURRENT_TRY=$(( REMAINING < BATCH ? REMAINING : BATCH ))
+                  TARGET_REV=${COMMITS[$((INDEX + CURRENT_TRY - 1))]}
 
-                  if [ -n "$MIRROR_TIP" ]; then
-                    mapfile -t COMMITS < <(git rev-list --reverse --ancestry-path "${MIRROR_TIP}..refs/heads/${CURRENT_BRANCH}")
-                  else
-                    mapfile -t COMMITS < <(git rev-list --reverse "refs/heads/$CURRENT_BRANCH")
-                  fi
-
-                  TOTAL=${#COMMITS[@]}
-
-                  if [ "$TOTAL" -eq 0 ]; then
-                    log "Already up-to-date. skip"
-                    break
-                  fi
-
-                  log "Total new commits: $TOTAL (mirror tip: ${MIRROR_TIP:-none})"
-
-                  if [ "$BATCH" -eq 0 ]; then
-                    CURRENT_TRY=$TOTAL
-                  else
-                    CURRENT_TRY=$(( TOTAL < BATCH ? TOTAL : BATCH ))
-                  fi
-
-                  TARGET_REV=${COMMITS[$((CURRENT_TRY - 1))]}
-
-                  log "--- Attempting: $CURRENT_TRY commits (Progress (approx): $PROCESSED/$TOTAL_ORIG) ---"
+                  log "--- Attempting: $CURRENT_TRY commits (Progress: $PROCESSED/$TOTAL) ---"
 
                   if git push mirror "$TARGET_REV:refs/heads/$CURRENT_BRANCH"; then
                     log ">> Success."
-
                     PROCESSED=$((PROCESSED + CURRENT_TRY))
-
-                    if [ "$BATCH" -eq 0 ]; then
-                      BATCH=$CURRENT_TRY
-                    fi
+                    INDEX=$((INDEX + CURRENT_TRY))
 
                     BATCH=$((BATCH * 12 / 10 + 3))
                     [ $BATCH -gt $MAX_BATCH ] && BATCH=$MAX_BATCH
-
                     log ">> Increasing batch size to $BATCH for next step."
                   else
                     log ">> Failed! Reducing batch size..."
-
-                    if [ "$BATCH" -eq 0 ]; then
-                      BATCH=$((CURRENT_TRY / 2))
-                    else
-                      if [ $BATCH -gt $CURRENT_TRY ]; then
-                        BATCH=$CURRENT_TRY
-                      else
-                        if [ $BATCH -le 3 ]; then
-                          BATCH=$((BATCH - 1))
-                        else
-                          BATCH=$((BATCH / 2))
-                        fi
-                      fi
+                    if [ $CURRENT_TRY -le $MIN_BATCH ]; then
+                      log "Fatal: Single commit push failed. Check for large files or remote limits."
+                      return 1
                     fi
-
-                    if [ $BATCH -lt $MIN_BATCH ]; then
-                      if [ $CURRENT_TRY -eq 1 ]; then
-                        log "Fatal: Single commit push failed. Check for large files or remote limits."
-                        return 1
-                      fi
-                      BATCH=$MIN_BATCH
-                    fi
-
+                    BATCH=$((BATCH / 2))
+                    [ $BATCH -lt $MIN_BATCH ] && BATCH=$MIN_BATCH
                     log ">> Retrying with smaller batch: $BATCH"
                   fi
                 done
               done
+
               gh repo edit "kernelorg-mirror/$repo" --default-branch "$( git remote show origin | grep "^  HEAD branch: " | cut -c 16- )"
               git push mirror --mirror
             fi
