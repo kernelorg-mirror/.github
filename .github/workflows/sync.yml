@@ -96,7 +96,7 @@ jobs:
           git config --global fetch.showForcedUpdates false
           git config --global http.postBuffer 524288000
           git config --global http.lowSpeedLimit 1000
-          git config --global http.lowSpeedTime 60
+          git config --global http.lowSpeedTime 600
 
           # not required
           git config --global init.defaultBranch main
